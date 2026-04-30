@@ -19,6 +19,7 @@ import storage
 import risk
 from analyzer import compute_short_scores, compute_composite_scores
 from market import get_mark_price, get_klines_1h
+import binance_real
 
 
 MAX_ENTRY_CHANGE_15M = 5.0
@@ -291,6 +292,37 @@ def _build_account_context(conn) -> risk.AccountContext:
     )
 
 
+def _place_live_order(symbol, side, quantity, leverage, stop_loss_price):
+    """实盘下单包装: set_leverage -> set_isolated -> place_market -> place_algo_stop_close.
+
+    成功返回 {ok: True, fill_price, order_id, stop_order_id}.
+    失败返回 {ok: False, error}.
+    """
+    try:
+        binance_real.set_leverage(symbol, int(leverage))
+        binance_real.set_isolated(symbol)
+        order = binance_real.place_market(symbol, side, quantity, reduce_only=False)
+        fill_price = float(order.get("avgPrice") or order.get("price") or 0)
+        if fill_price <= 0:
+            pos_info = binance_real.get_position(symbol)
+            if pos_info:
+                fill_price = float(pos_info.get("entryPrice") or 0)
+        if fill_price <= 0:
+            return {"ok": False, "error": f"missing fill_price; order={order}"}
+        stop_side = "SELL" if side == "BUY" else "BUY"
+        stop_order = binance_real.place_algo_stop_close(symbol, stop_side, stop_loss_price)
+        return {
+            "ok": True,
+            "fill_price": fill_price,
+            "order_id": str(order.get("orderId") or ""),
+            "stop_order_id": str(stop_order.get("orderId") or ""),
+        }
+    except binance_real.BinanceAPIError as e:
+        return {"ok": False, "error": f"binance API: {e}"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 def _debug_reject(token: str, reason: str, candidate: dict = None):
     """TRADING_DEBUG 为 True 时打印开仓拒绝原因到 stderr，便于诊断"""
     if not getattr(config, "TRADING_DEBUG", False):
@@ -423,9 +455,42 @@ def open_paper_position(conn, candidate: dict, settings: dict) -> bool | dict:
             f"{sizing.get('stop_distance_pct', 0):.2f}% 止损"
         ),
     }
+    # ===== 实盘分支: 先调币安下单, 再用真实成交价覆盖入场价 =====
+    mode = (settings.get("mode") or "paper").lower()
+    if mode == "live":
+        live = _place_live_order(position["symbol"], "BUY", quantity, leverage, stop_loss_price)
+        if not live["ok"]:
+            _debug_reject(token, f"实盘下单失败: {live.get('error')}", candidate)
+            return False
+        fill_price = live["fill_price"]
+        new_risk = fill_price - stop_loss_price
+        if new_risk <= 0:
+            try:
+                binance_real.place_market(position["symbol"], "SELL", quantity, reduce_only=True)
+            except Exception:
+                pass
+            _debug_reject(token, f"成交价 {fill_price} 已破止损 {stop_loss_price}, 紧急平仓", candidate)
+            return False
+        position["entry_price"] = fill_price
+        position["limit_price"] = fill_price
+        position["current_price"] = fill_price
+        position["highest_price"] = fill_price
+        position["tp1_price"] = fill_price + new_risk * config.TRADING_TP1_R
+        position["tp2_price"] = fill_price + new_risk * config.TRADING_TP2_R
+        snapshot["_risk_meta"]["live_order_id"] = live["order_id"]
+        snapshot["_risk_meta"]["live_stop_order_id"] = live["stop_order_id"]
+        snapshot["_risk_meta"]["live_fill_price"] = fill_price
+        position["signal_snapshot"] = json.dumps(snapshot, default=str, ensure_ascii=False)
+
     ok = storage.trade_position_insert(conn, position)
     if not ok:
         _debug_reject(token, "DB insert 失败（唯一索引冲突？）", candidate)
+        if mode == "live":
+            try:
+                binance_real.cancel_all_orders(position["symbol"])
+                binance_real.place_market(position["symbol"], "SELL", quantity, reduce_only=True)
+            except Exception:
+                pass
     return ok
 
 
@@ -444,9 +509,7 @@ def manual_open_on_watch(conn, token: str, settings: dict) -> dict:
     if storage.trade_has_active(conn, token):
         return {"ok": False, "reason": f"{token} 已有持仓或挂单"}
 
-    mode = settings.get("mode") or "paper"
-    if mode != "paper":
-        return {"ok": False, "reason": f"当前模式 {mode}，实盘下单未启用"}
+    mode = (settings.get("mode") or "paper").lower()
 
     market = _load_market(conn, token)
     realtime = _load_realtime(conn, token)
@@ -520,7 +583,7 @@ def manual_open_on_watch(conn, token: str, settings: dict) -> dict:
         "symbol": f"{token}USDT",
         "side": "LONG",
         "status": "OPEN",
-        "mode": "paper",
+        "mode": mode,
         "margin_amount": margin,
         "leverage": leverage,
         "notional": notional,
@@ -540,7 +603,37 @@ def manual_open_on_watch(conn, token: str, settings: dict) -> dict:
         ),
         "advice": f"手动开仓持有：等待止盈或 {sizing.get('stop_distance_pct', 0):.2f}% 止损",
     }
+    # 实盘分支: 同 open_paper_position 先调币安下单, 再用真实成交价覆盖
+    if mode == "live":
+        live = _place_live_order(position["symbol"], "BUY", quantity, leverage, stop_loss_price)
+        if not live["ok"]:
+            return {"ok": False, "reason": f"实盘下单失败: {live.get('error')}"}
+        fill_price = live["fill_price"]
+        new_risk = fill_price - stop_loss_price
+        if new_risk <= 0:
+            try:
+                binance_real.place_market(position["symbol"], "SELL", quantity, reduce_only=True)
+            except Exception:
+                pass
+            return {"ok": False, "reason": f"成交价 {fill_price} 已破止损 {stop_loss_price}, 紧急平仓"}
+        position["entry_price"] = fill_price
+        position["limit_price"] = fill_price
+        position["current_price"] = fill_price
+        position["highest_price"] = fill_price
+        position["tp1_price"] = fill_price + new_risk * config.TRADING_TP1_R
+        position["tp2_price"] = fill_price + new_risk * config.TRADING_TP2_R
+        snapshot["_risk_meta"]["live_order_id"] = live["order_id"]
+        snapshot["_risk_meta"]["live_stop_order_id"] = live["stop_order_id"]
+        snapshot["_risk_meta"]["live_fill_price"] = fill_price
+        position["signal_snapshot"] = json.dumps(snapshot, default=str, ensure_ascii=False)
+
     if not storage.trade_position_insert(conn, position):
+        if mode == "live":
+            try:
+                binance_real.cancel_all_orders(position["symbol"])
+                binance_real.place_market(position["symbol"], "SELL", quantity, reduce_only=True)
+            except Exception:
+                pass
         return {"ok": False, "reason": "DB 写入失败（可能并发冲突）"}
     return {
         "ok": True, "token": token,
@@ -669,6 +762,118 @@ def _archive_stop_loss(conn, pos: dict, exit_price: float, realized: float,
     })
 
 
+def _reconcile_live_position(conn, pos, market, realtime, price):
+    """Live 持仓 reconcile: 同步币安实际持仓 + 触发 TP1/TP2/移动止盈."""
+    symbol = pos["symbol"]
+    qty = float(pos.get("quantity") or 0)
+    closed_qty = float(pos.get("closed_qty") or 0)
+    open_qty = max(qty - closed_qty, 0)
+    realized = float(pos.get("realized_pnl") or 0)
+    entry = float(pos.get("entry_price") or pos.get("limit_price") or 0)
+    margin = float(pos.get("margin_amount") or 1)
+
+    try:
+        live_pos = binance_real.get_position(symbol)
+    except Exception:
+        storage.trade_position_update(conn, pos["id"], {"current_price": price})
+        return
+
+    live_size = float(live_pos.get("positionAmt") or 0) if live_pos else 0.0
+
+    if abs(live_size) < 1e-10 and open_qty > 0:
+        realized += (price - entry) * open_qty
+        storage.trade_position_update(conn, pos["id"], {
+            "status": "CLOSED",
+            "current_price": price,
+            "closed_qty": qty,
+            "realized_pnl": realized,
+            "unrealized_pnl": 0,
+            "pnl_pct": _margin_pnl_pct(realized, 0, margin),
+            "advice": f"实盘外部平仓 (止损/手动) @ ${price:.6g}",
+            "closed_at": "__CURRENT_TIMESTAMP__",
+        })
+        return
+
+    if open_qty <= 0 or entry <= 0:
+        return
+
+    highest = max(float(pos.get("highest_price") or entry), price)
+    fields = {"current_price": price, "highest_price": highest}
+    tp1 = float(pos.get("tp1_price") or 0)
+    tp2 = float(pos.get("tp2_price") or 0)
+    tp1_pct = config.TRADING_TP1_CLOSE_PCT / 100
+    tp2_pct = config.TRADING_TP2_CLOSE_PCT / 100
+    closed_ratio = closed_qty / qty if qty > 0 else 0
+    tp1_done = closed_ratio >= tp1_pct - 1e-6
+    tp2_done = closed_ratio >= (tp1_pct + tp2_pct) - 1e-6
+
+    if not tp1_done and tp1 > 0 and price >= tp1:
+        close_qty = qty * tp1_pct
+        try:
+            binance_real.place_market(symbol, "SELL", close_qty, reduce_only=True)
+            realized += (price - entry) * close_qty
+            closed_qty += close_qty
+            open_qty = qty - closed_qty
+            fields.update({
+                "status": "PARTIAL",
+                "closed_qty": closed_qty,
+                "realized_pnl": realized,
+                "stop_loss_price": entry,
+                "advice": f"实盘 TP1 已平 {config.TRADING_TP1_CLOSE_PCT:.0f}% @ ${price:.6g}",
+            })
+            tp1_done = True
+        except Exception as e:
+            fields["advice"] = f"TP1 下单失败: {e}"
+
+    if tp1_done and not tp2_done and tp2 > 0 and price >= tp2:
+        close_qty = qty * tp2_pct
+        try:
+            binance_real.place_market(symbol, "SELL", close_qty, reduce_only=True)
+            realized += (price - entry) * close_qty
+            closed_qty += close_qty
+            open_qty = qty - closed_qty
+            trailing = highest * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100)
+            fields.update({
+                "status": "PARTIAL",
+                "closed_qty": closed_qty,
+                "realized_pnl": realized,
+                "trailing_stop_price": trailing,
+                "advice": f"实盘 TP2 已再平 {config.TRADING_TP2_CLOSE_PCT:.0f}% @ ${price:.6g}",
+            })
+            tp2_done = True
+        except Exception as e:
+            fields["advice"] = f"TP2 下单失败: {e}"
+
+    if tp2_done and open_qty > 0:
+        trailing = max(float(pos.get("trailing_stop_price") or 0),
+                   highest * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100))
+        fields["trailing_stop_price"] = trailing
+        if price <= trailing:
+            try:
+                binance_real.place_market(symbol, "SELL", open_qty, reduce_only=True)
+                realized += (price - entry) * open_qty
+                fields.update({
+                    "status": "CLOSED",
+                    "closed_qty": qty,
+                    "realized_pnl": realized,
+                    "unrealized_pnl": 0,
+                    "pnl_pct": _margin_pnl_pct(realized, 0, margin),
+                    "advice": f"实盘跟踪止盈 @ ${price:.6g}",
+                    "closed_at": "__CURRENT_TIMESTAMP__",
+                })
+                storage.trade_position_update(conn, pos["id"], fields)
+                return
+            except Exception as e:
+                fields["advice"] = f"跟踪止盈下单失败: {e}"
+
+    unrealized = (price - entry) * open_qty
+    fields.update({
+        "unrealized_pnl": unrealized,
+        "pnl_pct": _margin_pnl_pct(realized, unrealized, margin),
+    })
+    storage.trade_position_update(conn, pos["id"], fields)
+
+
 def update_paper_positions(conn):
     positions = storage.trade_open_positions(conn)
     for pos in positions:
@@ -676,6 +881,10 @@ def update_paper_positions(conn):
         realtime = _load_realtime(conn, pos["token"])
         price = _position_price(pos["token"], market, realtime)
         if not price:
+            continue
+
+        if (pos.get("mode") or "paper").lower() == "live":
+            _reconcile_live_position(conn, pos, market, realtime, price)
             continue
 
         status = pos["status"]

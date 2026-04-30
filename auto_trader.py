@@ -1,8 +1,8 @@
 """Automatic trading loop.
 
-Default mode is paper trading. It evaluates the existing leaderboard and market
-cache, creates paper limit orders when all entry rules pass, and manages the
--2% stop loss plus staged take profit.
+Evaluates the existing leaderboard and market cache, opens
+positions when all entry rules pass, and manages stop loss
+plus staged take profit. Mode is controlled by config.TRADING_MODE.
 
 Run:
     python auto_trader.py
@@ -45,39 +45,36 @@ def one_scan():
     if not settings.get("enabled"):
         return {"opened": 0, "enabled": False}
 
-    if settings.get("mode") != "paper":
-        # Live trading is deliberately not enabled in this implementation.
-        return {"opened": 0, "enabled": True, "live_blocked": True}
-
     with storage.get_conn() as conn:
         candidates = trade_logic.build_trade_candidates(
             conn, limit=config.COMPOSITE_HEAT_TOP_N, passed_only=True)
 
     opened = 0
+    mode_label = (settings.get("mode") or "paper").lower()
     for candidate in candidates:
         if not candidate.get("has_active_position"):
             with storage.get_conn() as conn:
                 if trade_logic.open_paper_position(conn, candidate, settings):
                     opened += 1
                     console.print(
-                        f"[green]模拟市价开多信号: {candidate['token']} "
+                        f"[green]{mode_label} 市价开多: {candidate['token']} "
                         f"price={candidate['price']:.8g}[/green]"
                     )
-    return {"opened": opened, "enabled": True}
+    return {"opened": opened, "enabled": True, "mode": mode_label}
 
 
 def main():
     storage.init_db()
-    console.print("[green]=== 自动交易循环启动（默认模拟交易） ===[/green]")
-    console.print("[dim]Web 面板里打开自动交易后，才会按规则生成模拟市价多单。[/dim]")
+    mode = (config.TRADING_MODE or "paper").lower()
+    banner = "实盘交易" if mode == "live" else "模拟交易"
+    console.print(f"[green]=== 自动交易循环启动（{banner}） ===[/green]")
+    console.print("[dim]Web 面板里打开自动交易后，才会按规则下单。[/dim]")
     last_cleanup_at = 0.0
     while _running:
         try:
             result = one_scan()
-            if result.get("live_blocked"):
-                console.print("[yellow]当前设置为 live，但实盘下单尚未启用；本轮跳过。[/yellow]")
-            elif result.get("enabled") and result.get("opened"):
-                console.print(f"[green]本轮新增模拟订单 {result['opened']} 个[/green]")
+            if result.get("enabled") and result.get("opened"):
+                console.print(f"[green]本轮新增订单 {result['opened']} 个[/green]")
 
             # 每小时清理一次旧的 signal lock，防止表无限膨胀
             now = time.time()

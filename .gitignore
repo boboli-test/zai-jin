@@ -1,58 +1,40 @@
-# =============== Python ===============
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-*.egg
-.eggs/
-build/
-dist/
+# 备份文件
+*.bak
+*.bak.*
+*.bak.p1.*
+*.bak.p2.*
+*.bak.p3.*
+*.bak.p4.*
+*.bak.p56.*
+*.bak.p56v2.*
+*.bak.p56v3.*
 
-# =============== 虚拟环境 ===============
-.venv/
-venv/
-env/
-ENV/
+# 密钥 / 环境
+.env
+.env.*
+.env.placeholder
 
-# =============== 项目运行时数据（不要传到 GitHub）===============
 # 数据库
 *.db
 *.db-journal
-*.db-shm
 *.db-wal
+*.db-shm
 binance_square.db*
 
-# 进程状态
-.monitor_processes.json
-
-# Playwright 持久化登录数据
-user_data/
-.user_data/
-
 # 日志
-*.log
 logs/
+*.log
 
-# =============== 编辑器 / IDE ===============
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# IDE
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
 
-# =============== 系统 ===============
+# 系统
 .DS_Store
-Thumbs.db
-desktop.ini
-
-# =============== 测试 / 覆盖率 ===============
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-
-# =============== 个人配置覆盖（如果用户想本地 override 某些参数）===============
-config_local.py
-.env
-.env.local

@@ -77,10 +77,10 @@ COMPOSITE_HEAT_TOP_N = 20            # 综合热度榜显示前 N
 COMPOSITE_HISTORY_WINDOW = 20        # 综合热度参考最近 N 轮历史
 
 # === 自动交易（默认模拟，不会真实下单）===
-TRADING_ENABLED = False
-TRADING_MODE = "paper"               # paper / live
-TRADING_INITIAL_BALANCE = 1000.0
-TRADING_LEVERAGE = 2
+TRADING_ENABLED = True
+TRADING_MODE = "live"               # paper / live
+TRADING_INITIAL_BALANCE = 100.0
+TRADING_LEVERAGE = 5
 
 # --- 仓位 sizing（专业量化风格：先定风险，再反推仓位）---
 # 默认使用"风险优先"模式：每笔交易最多亏损账户净值的 RISK_PER_TRADE_PCT
@@ -92,10 +92,10 @@ TRADING_MIN_NOTIONAL = 10.0              # 名义价值下限，低于此值不�
 TRADING_MAX_NOTIONAL_PCT = 50.0          # 单笔名义价值不超过账户净值的百分比
 
 # --- 风控硬限制 ---
-TRADING_MAX_CONCURRENT_POSITIONS = 0     # v2.5：0 = 不限制（用户要求）。
+TRADING_MAX_CONCURRENT_POSITIONS = 3     # v2.5：0 = 不限制（用户要求）。
                                           # 可用余额自然限制实际能开的仓位数。
 TRADING_MAX_DAILY_LOSS_PCT = 5.0         # 当日浮动+已实现亏损超该百分比则熔断停机
-TRADING_MAX_DAILY_TRADES = 15            # 当日最多开仓次数
+TRADING_MAX_DAILY_TRADES = 5            # 当日最多开仓次数
 TRADING_COOLDOWN_MINUTES_AFTER_LOSS = 30 # 同一 token 止损后冷却期（分钟）
 TRADING_CORRELATED_LIMIT = 2             # 相关度高的板块同向仓位上限（目前按粗分类）
 
@@ -161,7 +161,7 @@ TRADING_ALLOW_15M_PULLBACK_PCT = -1.5    # 15m 允许回调到 -1.5% 以内仍�
 TRADING_PREFER_SMART_MONEY_DIVERGENCE = True  # top_lsr > 1.5 且 lsr < 0.7 时优先开仓
 
 # --- 滑点 / 订单 ---
-TRADING_ASSUMED_SLIPPAGE_PCT = 0.05      # 模拟交易假设的市价滑点（入场）
+TRADING_ASSUMED_SLIPPAGE_PCT = 0.20      # 模拟交易假设的市价滑点（入场）
 TRADING_STOP_SLIPPAGE_PCT = 0.15         # 止损触发时的假设滑点（通常更坏）
 TRADING_LIMIT_ORDER_TIMEOUT_SECONDS = 10
 
