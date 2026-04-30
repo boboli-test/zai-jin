@@ -38,3 +38,7 @@ venv/
 
 # 系统
 .DS_Store
+user_data/
+trading_data.db
+lana-lite-*.tar.gz
+*.session
