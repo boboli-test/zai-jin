@@ -820,6 +820,11 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
 
     if abs(live_size) < 1e-10 and open_qty > 0:
         realized += (price - entry) * open_qty
+        # P9.5: 外部平仓 — 撤所有 algo
+        try:
+            binance_real.cancel_all_orders(symbol)
+        except Exception as _e:
+            print(f"[reconcile] external close cancel failed {symbol}: {_e}", flush=True)
         storage.trade_position_update(conn, pos["id"], {
             "status": "CLOSED",
             "current_price": price,
@@ -859,6 +864,11 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
                 "advice": f"实盘 hard stop 平仓 @ ${price:.6g}",
                 "closed_at": "__CURRENT_TIMESTAMP__",
             })
+            # P9.5: hard stop — 撤所有 algo
+            try:
+                binance_real.cancel_all_orders(symbol)
+            except Exception as _e:
+                print(f"[reconcile] hard stop cancel failed {symbol}: {_e}", flush=True)
             storage.trade_position_update(conn, pos["id"], fields)
             return
         except Exception as e:
@@ -882,6 +892,15 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
                 "advice": f"实盘 TP1 已平 {config.TRADING_TP1_CLOSE_PCT:.0f}% @ ${price:.6g}",
             })
             tp1_done = True
+            # P9.5: TP1 后 sl 拉到保本
+            try:
+                _r = binance_real.replace_algo_stop(symbol, "SELL", new_stop_price=entry, qty=open_qty)
+                if "error" not in _r:
+                    fields["binance_synced_stop_price"] = entry
+                else:
+                    fields["advice"] += f" | algo 同步失败: {_r['error']}"
+            except Exception as _e:
+                fields["advice"] += f" | algo 异常: {_e}"
         except Exception as e:
             fields["advice"] = f"TP1 下单失败: {e}"
 
@@ -901,6 +920,15 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
                 "advice": f"实盘 TP2 已再平 {config.TRADING_TP2_CLOSE_PCT:.0f}% @ ${price:.6g}",
             })
             tp2_done = True
+            # P9.5: TP2 后 sl 改 trailing
+            try:
+                _r = binance_real.replace_algo_stop(symbol, "SELL", new_stop_price=trailing, qty=open_qty)
+                if "error" not in _r:
+                    fields["binance_synced_stop_price"] = trailing
+                else:
+                    fields["advice"] += f" | algo 同步失败: {_r['error']}"
+            except Exception as _e:
+                fields["advice"] += f" | algo 异常: {_e}"
         except Exception as e:
             fields["advice"] = f"TP2 下单失败: {e}"
 
@@ -910,6 +938,15 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
             highest * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100),
         )
         fields["trailing_stop_price"] = trailing
+        # P9.5: trailing 上调时同步 binance algo (0.1% 防抖)
+        _last_synced = float(pos.get("binance_synced_stop_price") or 0)
+        if abs(trailing - _last_synced) > entry * 0.001:
+            try:
+                _r = binance_real.replace_algo_stop(symbol, "SELL", new_stop_price=trailing, qty=open_qty)
+                if "error" not in _r:
+                    fields["binance_synced_stop_price"] = trailing
+            except Exception:
+                pass
         if price <= trailing:
             try:
                 binance_real.place_market(symbol, "SELL", open_qty, reduce_only=True)
@@ -923,6 +960,11 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
                     "advice": f"实盘跟踪止盈 @ ${price:.6g}",
                     "closed_at": "__CURRENT_TIMESTAMP__",
                 })
+                # P9.5: trailing close — 撤所有 algo
+                try:
+                    binance_real.cancel_all_orders(symbol)
+                except Exception as _e:
+                    print(f"[reconcile] trailing close cancel failed {symbol}: {_e}", flush=True)
             except Exception as e:
                 fields["advice"] = f"trailing 平仓失败: {e}"
 
