@@ -1,44 +1,22 @@
-# 备份文件
-*.bak
-*.bak.*
-*.bak.p1.*
-*.bak.p2.*
-*.bak.p3.*
-*.bak.p4.*
-*.bak.p56.*
-*.bak.p56v2.*
-*.bak.p56v3.*
-
-# 密钥 / 环境
-.env
-.env.*
-.env.placeholder
-
-# 数据库
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
-binance_square.db*
-
-# 日志
-logs/
-*.log
-
 # Python
 __pycache__/
 *.pyc
+*.pyo
 .venv/
-venv/
-.pytest_cache/
 
-# IDE
-.vscode/
-.idea/
+# Backups
+*.bak
+*.bak.*
 
-# 系统
-.DS_Store
-user_data/
-trading_data.db
-lana-lite-*.tar.gz
-*.session
+# Logs
+logs/
+*.log
+
+# DB
+binance_square.db
+binance_square.db-*
+
+# Temp / scripts
+p95.sh
+*.tmp
+/tmp/
