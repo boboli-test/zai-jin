@@ -178,3 +178,6 @@ MANUAL_BYPASS_MAX_CONCURRENT = True   # 手动开仓不受 MAX_CONCURRENT_POSITI
 MANUAL_BYPASS_SECTOR_LIMIT = True     # 手动开仓不受板块集中度限制
 MANUAL_BYPASS_COOLDOWN = False        # 手动开仓仍受止损冷却期约束（建议 False 保护）
 # 注意：日亏损熔断永远不豁免，这是最后的保命线
+
+# P8 (2026-04-30): API key 客观限制不允许 conditional 单, 用 watcher 兜底
+DISABLE_BINANCE_ALGO_STOP = False

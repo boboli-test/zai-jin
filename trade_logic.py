@@ -345,7 +345,7 @@ def _place_live_order(symbol, side, quantity, leverage, stop_loss_price):
     stop_side = "SELL" if side == "BUY" else "BUY"
     stop_order_id = ""
     try:
-        stop_order = binance_real.place_algo_stop_close(symbol, stop_side, stop_loss_price)
+        stop_order = binance_real.place_algo_stop_close(symbol, stop_side, stop_loss_price, qty=quantity)
         stop_order_id = str(stop_order.get("algoId") or stop_order.get("orderId") or "")
     except Exception as e:
         try:

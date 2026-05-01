@@ -276,26 +276,34 @@ def place_market(symbol, side, qty, reduce_only=False, client_order_id=None):
     return r
 
 
-def place_algo_stop_close(symbol, side, stop_price, client_algo_id=None):
-    """硬止损 (Algo Service, 2025-12-09 后强制路径)。
-       side = 平仓方向 (LONG 持仓→SELL, SHORT 持仓→BUY)。
-       closePosition=true 不需要 quantity, workingType=MARK_PRICE 防针刺。"""
-    sp_r = round_price(symbol, stop_price)
+def place_algo_stop_close(symbol, side, stop_price, qty=None, working_type="MARK_PRICE"):
+    """挂币安 algo 止损单 (P9.2 lana-lite verified schema, 2026-04-30).
+    - algoType=CONDITIONAL + type=STOP_MARKET (post-2025-12-09 强制 algoOrder)
+    - quantity + reduceOnly:true (此账户对 closePosition=true 报 -4509 GTE TIF)
+    - qty 不传则从持仓 positionAmt 自动拉
+    返回 dict: {algoId, algoStatus, triggerPrice, ...} 或 raise BinanceAPIError
+    """
+    if qty is None or float(qty) <= 0:
+        try:
+            pos = get_position(symbol)
+            qty = abs(float((pos or {}).get("positionAmt", 0)))
+        except Exception:
+            qty = 0
+    if not qty or float(qty) <= 0:
+        raise ValueError("place_algo_stop_close: cannot determine qty for " + symbol)
+    qty_r = round_qty(symbol, float(qty))
+    price_r = round_price(symbol, float(stop_price))
     params = {
-        "symbol": symbol,
-        "side": side,
         "algoType": "CONDITIONAL",
+        "symbol": symbol,
+        "side": side.upper(),
         "type": "STOP_MARKET",
-        "stopPrice": sp_r,
-        "closePosition": "true",
-        "workingType": "MARK_PRICE",
-        "priceProtect": "true",
+        "triggerPrice": price_r,
+        "quantity": qty_r,
+        "reduceOnly": "true",
+        "workingType": working_type,
     }
-    if client_algo_id:
-        params["newClientAlgoId"] = client_algo_id
-    r = _request("POST", "/fapi/v1/algoOrder", params=params, signed=True)
-    print(f"[binance_real] STOP_MARKET {side} {symbol} stop={sp_r} -> algoId={r.get('algoId') or r.get('orderId')}", flush=True)
-    return r
+    return _request("POST", "/fapi/v1/algoOrder", params, signed=True)
 
 
 def cancel_algo_order(symbol, algo_id=None, client_algo_id=None):
@@ -343,6 +351,21 @@ def cancel_all_orders(symbol):
     except BinanceAPIError as e:
         results["algo_err"] = str(e)
     return results
+
+
+def replace_algo_stop(symbol, side, new_stop_price, qty):
+    """P9.5: 原子替换 hard stop algo (cancel + 重挂)."""
+    cancelled = []
+    try:
+        result = cancel_all_orders(symbol)
+        cancelled = result.get("algo", []) if isinstance(result, dict) else []
+    except Exception as e:
+        cancelled = [{"error": str(e)}]
+    try:
+        placed = place_algo_stop_close(symbol, side, new_stop_price, qty=qty)
+        return {"cancelled": cancelled, "placed": placed}
+    except Exception as e:
+        return {"cancelled": cancelled, "error": str(e)}
 
 
 # ---------- 仓位查询 ----------
