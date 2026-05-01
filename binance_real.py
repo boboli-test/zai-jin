@@ -412,3 +412,23 @@ def get_mark_price(symbol):
     j = _request("GET", "/fapi/v1/premiumIndex", params={"symbol": symbol})
     return float(j.get("markPrice", 0))
 
+
+
+# P11 (2026-05-01): LIVE balance snapshot, 5s cache
+_balance_cache = {"data": None, "ts": 0.0}
+_BALANCE_CACHE_TTL = 5.0
+
+
+def get_account_overview(use_cache=True):
+    """LIVE: {wallet_balance, available_balance, unrealized_pnl, equity}."""
+    global _balance_cache
+    now = time.time()
+    if use_cache and _balance_cache["data"] and (now - _balance_cache["ts"]) < _BALANCE_CACHE_TTL:
+        return _balance_cache["data"]
+    j = _request("GET", "/fapi/v2/account", signed=True)
+    wallet = float(j.get("totalWalletBalance", 0) or 0)
+    unpnl = float(j.get("totalUnrealizedProfit", 0) or 0)
+    avail = float(j.get("availableBalance", 0) or 0)
+    data = {"wallet_balance": wallet, "available_balance": avail, "unrealized_pnl": unpnl, "equity": wallet + unpnl}
+    _balance_cache = {"data": data, "ts": now}
+    return data

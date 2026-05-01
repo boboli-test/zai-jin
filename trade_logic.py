@@ -151,6 +151,12 @@ def evaluate_candidate(score_row: dict, rank: int, market: dict, realtime: dict)
 
     quality = risk.evaluate_entry_quality(snap, realtime, signal_score, verdict)
 
+    # P10 (2026-05-01): rank > 6 历史亏损区硬否决
+    # paper 10 单回测: rank<=6 -> 2/2 wins +$1.469, rank>6 -> 2/8 wins -$1.976
+    if rank and rank > 6:
+        quality["hard_block"].append(f"rank={rank} > 6 (P10 历史亏损区)")
+        quality["tier"] = "skip"
+
     tier = quality["tier"]
     passed = tier != "skip"
 
@@ -257,6 +263,17 @@ def account_summary(conn) -> dict:
                  for p in positions if p.get("status") in {"PENDING", "OPEN", "PARTIAL"})
     equity = initial + realized + unrealized
     available = initial + realized - locked
+
+    # P11 (2026-05-01): LIVE binance equity override
+    if config.TRADING_MODE == "live":
+        try:
+            ov = binance_real.get_account_overview()
+            equity = ov["equity"]
+            available = ov["available_balance"]
+            unrealized = ov["unrealized_pnl"]
+        except Exception as e:
+            print(f"[trade_logic] WARN P11: {e}", flush=True)
+
     return {
         "settings": settings,
         "initial_balance": round(initial, 4),
