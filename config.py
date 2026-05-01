@@ -92,10 +92,10 @@ TRADING_MIN_NOTIONAL = 10.0              # 名义价值下限，低于此值不�
 TRADING_MAX_NOTIONAL_PCT = 50.0          # 单笔名义价值不超过账户净值的百分比
 
 # --- 风控硬限制 ---
-TRADING_MAX_CONCURRENT_POSITIONS = 3     # v2.5：0 = 不限制（用户要求）。
+TRADING_MAX_CONCURRENT_POSITIONS = 6     # v2.5：0 = 不限制（用户要求）。
                                           # 可用余额自然限制实际能开的仓位数。
 TRADING_MAX_DAILY_LOSS_PCT = 5.0         # 当日浮动+已实现亏损超该百分比则熔断停机
-TRADING_MAX_DAILY_TRADES = 5            # 当日最多开仓次数
+TRADING_MAX_DAILY_TRADES = 20             # 当日最多开仓次数
 TRADING_COOLDOWN_MINUTES_AFTER_LOSS = 30 # 同一 token 止损后冷却期（分钟）
 TRADING_CORRELATED_LIMIT = 2             # 相关度高的板块同向仓位上限（目前按粗分类）
 
@@ -181,3 +181,8 @@ MANUAL_BYPASS_COOLDOWN = False        # 手动开仓仍受止损冷却期约束�
 
 # P8 (2026-04-30): API key 客观限制不允许 conditional 单, 用 watcher 兜底
 DISABLE_BINANCE_ALGO_STOP = False
+
+# P12-C: real-state reconcile + zombie killer
+P12C_RECONCILE_ENABLED   = True
+P12C_DRY_RUN             = False   # safe default; flip to False after dry-run verifies
+P12C_ZOMBIE_KILL_ENABLED = True

@@ -327,7 +327,7 @@ def list_open_algo_orders(symbol=None):
     params = {}
     if symbol:
         params["symbol"] = symbol
-    return _request("GET", "/fapi/v1/algoOrder/open-orders", params=params, signed=True)
+    return _request("GET", "/fapi/v1/openAlgoOrders", params=params, signed=True)
 
 
 def cancel_all_orders(symbol):
@@ -432,3 +432,147 @@ def get_account_overview(use_cache=True):
     data = {"wallet_balance": wallet, "available_balance": avail, "unrealized_pnl": unpnl, "equity": wallet + unpnl}
     _balance_cache = {"data": data, "ts": now}
     return data
+
+
+# P12-A (2026-05-01): targeted cancel + replace, no list_open_algo_orders dep
+def cancel_specific_algo(symbol, algo_id):
+    """precise algo cancel (-2011 = success)"""
+    if not algo_id:
+        return {"ok": False, "msg": "no algo_id"}
+    try:
+        r = cancel_algo_order(symbol, algo_id=str(algo_id))
+        return {"ok": True, "result": r}
+    except BinanceAPIError as e:
+        if getattr(e, 'code', None) == -2011:
+            return {"ok": True, "msg": "already gone (-2011)"}
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def replace_algo_stop_v2(symbol, side, new_stop_price, qty, old_algo_id):
+    """P12-A: cancel old algo by id + place new, no list dep"""
+    cancelled = cancel_specific_algo(symbol, old_algo_id) if old_algo_id else {'ok': True, 'msg': 'no_old'}
+    try:
+        placed = place_algo_stop_close(symbol, side, new_stop_price, qty=qty)
+        new_id = placed.get('algoId') or placed.get('orderId') or ''
+        return {"cancelled": cancelled, "placed": placed, "new_algo_id": str(new_id)}
+    except Exception as e:
+        return {"cancelled": cancelled, "error": str(e), "new_algo_id": ""}
+
+
+# ============== P12-C: real-state reconcile + zombie killer ==============
+
+def _list_stops(symbol=None):
+    """P12-C: list STOP_MARKET reduceOnly algo orders, normalized."""
+    raw = list_open_algo_orders(symbol)
+    orders = []
+    if isinstance(raw, dict):
+        orders = raw.get("orders") or raw.get("data") or []
+    elif isinstance(raw, list):
+        orders = raw
+    out = []
+    for o in orders:
+        if not isinstance(o, dict): continue
+        otype = str(o.get("type") or o.get("orderType") or "").upper()
+        if otype != "STOP_MARKET": continue
+        ro = o.get("reduceOnly")
+        if ro not in (True, "true", "True", 1, "1"): continue
+        out.append(o)
+    return out
+
+
+def reconcile_position_stop(symbol, want_stop, want_qty, side="SELL", working_type="MARK_PRICE"):
+    """P12-C: declarative reconcile -- ensure exactly 1 STOP_MARKET reduceOnly.
+    Returns {action: kept|replaced|placed|list_failed|round_failed|skip_invalid|place_failed,
+             algo_id, removed: [...], error?}."""
+    try:
+        stops = _list_stops(symbol)
+    except BinanceAPIError as e:
+        return {"action": "list_failed", "algo_id": "", "removed": [], "error": str(e)}
+    side_u = side.upper()
+    same_side = [o for o in stops if str(o.get("side") or "").upper() == side_u]
+    try:
+        want_stop_r = round_price(symbol, float(want_stop))
+        want_qty_r  = round_qty(symbol, float(want_qty))
+    except Exception as e:
+        return {"action": "round_failed", "algo_id": "", "removed": [], "error": str(e)}
+    best = None
+    for o in same_side:
+        try:
+            sp = float(o.get("triggerPrice") or o.get("stopPrice") or 0)
+            q  = float(o.get("origQty") or o.get("quantity") or 0)
+        except Exception:
+            continue
+        if want_qty_r <= 0: continue
+        # P12-C-fix: price 0.5% tolerance (covers binance tick round); qty optional when None
+        _price_match = abs(sp - want_stop_r) <= max(want_stop_r * 0.005, 1e-6)
+        _qty_known = (o.get("origQty") is not None) or (o.get("quantity") is not None)
+        _qty_match = (not _qty_known) or (want_qty_r > 0 and abs(q - want_qty_r) / max(want_qty_r, 1e-8) < 0.05)
+        if _price_match and _qty_match:
+            best = o; break
+    removed = []
+    if best is not None:
+        keep_id = str(best.get("algoId") or "")
+        for o in same_side:
+            oid = str(o.get("algoId") or "")
+            if oid and oid != keep_id:
+                try:
+                    cancel_algo_order(symbol, algo_id=oid)
+                    removed.append(oid)
+                except Exception: pass
+        return {"action": "kept", "algo_id": keep_id, "removed": removed}
+    for o in same_side:
+        oid = str(o.get("algoId") or "")
+        if oid:
+            try:
+                cancel_algo_order(symbol, algo_id=oid)
+                removed.append(oid)
+            except Exception: pass
+    if want_qty_r <= 0 or want_stop_r <= 0:
+        return {"action": "skip_invalid", "algo_id": "", "removed": removed}
+    try:
+        placed = place_algo_stop_close(symbol, side_u, want_stop_r, qty=want_qty_r, working_type=working_type)
+        new_id = str((placed or {}).get("algoId") or (placed or {}).get("orderId") or "")
+        action = "replaced" if removed else "placed"
+        return {"action": action, "algo_id": new_id, "removed": removed}
+    except Exception as e:
+        return {"action": "place_failed", "algo_id": "", "removed": removed, "error": str(e)}
+
+
+def kill_zombie_algo_orders(active_symbols):
+    """P12-C: cancel STOP_MARKET reduceOnly orders whose symbol not in active_symbols
+    OR whose live positionAmt == 0. Returns list of {symbol, algo_id, stopPrice, qty, reason}."""
+    killed = []
+    try:
+        all_stops = _list_stops(None)
+    except BinanceAPIError:
+        return killed
+    active = set(s.upper() for s in (active_symbols or set()))
+    for o in all_stops:
+        sym = str(o.get("symbol") or "").upper()
+        oid = str(o.get("algoId") or "")
+        if not sym or not oid: continue
+        reason = None
+        if sym not in active:
+            reason = "not_in_active_set"
+        else:
+            try:
+                pos = get_position(sym)
+                live_sz = abs(float((pos or {}).get("positionAmt") or 0))
+                if live_sz < 1e-10:
+                    reason = "live_position_zero"
+            except Exception: pass
+        if reason:
+            try:
+                cancel_algo_order(sym, algo_id=oid)
+                killed.append({
+                    "symbol": sym, "algo_id": oid,
+                    "stopPrice": o.get("triggerPrice") or o.get("stopPrice"),
+                    "qty":       o.get("origQty") or o.get("quantity"),
+                    "reason":    reason,
+                })
+            except Exception: pass
+    return killed
+
+# ============== /P12-C ==============

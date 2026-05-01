@@ -538,6 +538,13 @@ def open_paper_position(conn, candidate: dict, settings: dict) -> bool | dict:
         position["signal_snapshot"] = json.dumps(snapshot, default=str, ensure_ascii=False)
 
     ok = storage.trade_position_insert(conn, position)
+    # P12-A: write binance_stop_algo_id after insert
+    if ok and (settings.get("mode") or "paper").lower() == "live":
+        _sid = locals().get("live", {}).get("stop_order_id") if locals().get("live") else ""
+        if _sid:
+            _row = conn.execute("SELECT id FROM trade_positions WHERE token=? ORDER BY id DESC LIMIT 1", (token,)).fetchone()
+            if _row:
+                storage.trade_position_update(conn, _row[0], {"binance_stop_algo_id": _sid})
     if not ok:
         _debug_reject(token, "DB insert 失败（唯一索引冲突？）", candidate)
         if mode == "live":
@@ -682,7 +689,15 @@ def manual_open_on_watch(conn, token: str, settings: dict) -> dict:
         snapshot["_risk_meta"]["live_fill_price"] = fill_price
         position["signal_snapshot"] = json.dumps(snapshot, default=str, ensure_ascii=False)
 
-    if not storage.trade_position_insert(conn, position):
+    _ins_ok = storage.trade_position_insert(conn, position)
+    # P12-A: write binance_stop_algo_id after insert
+    if _ins_ok and mode == "live":
+        _sid = locals().get("live", {}).get("stop_order_id") if locals().get("live") else ""
+        if _sid:
+            _row = conn.execute("SELECT id FROM trade_positions WHERE token=? ORDER BY id DESC LIMIT 1", (token,)).fetchone()
+            if _row:
+                storage.trade_position_update(conn, _row[0], {"binance_stop_algo_id": _sid})
+    if not _ins_ok:
         if mode == "live":
             try:
                 binance_real.cancel_all_orders(position["symbol"])
@@ -819,6 +834,16 @@ def _archive_stop_loss(conn, pos: dict, exit_price: float, realized: float,
 
 def _reconcile_live_position(conn, pos, market, realtime, price):
     """Live 持仓 reconcile (P7): 同步币安实际持仓 + hard stop / TP1/TP2/移动止盈."""
+    # P12-C: throttled periodic post-reconcile (60s interval, runs inside live loop)
+    try:
+        import time as _ptime
+        _now = _ptime.time()
+        _last = globals().get("_P12C_HOOK_LAST_RUN", 0.0)
+        if _now - _last >= 60.0:
+            globals()["_P12C_HOOK_LAST_RUN"] = _now
+            try: _p12c_post_reconcile(conn)
+            except Exception as _e: print(f"[P12C] hook err: {_e}", flush=True)
+    except Exception: pass
     symbol = pos["symbol"]
     qty = float(pos.get("quantity") or 0)
     closed_qty = float(pos.get("closed_qty") or 0)
@@ -826,6 +851,14 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
     realized = float(pos.get("realized_pnl") or 0)
     entry = float(pos.get("entry_price") or pos.get("limit_price") or 0)
     margin = float(pos.get("margin_amount") or 1)
+    # P12-A: current algo id (db column first, fallback _risk_meta.live_stop_order_id)
+    cur_algo_id = (pos.get("binance_stop_algo_id") or "").strip() if pos.get("binance_stop_algo_id") else ""
+    if not cur_algo_id:
+        try:
+            _meta = json.loads(pos.get("signal_snapshot") or "{}").get("_risk_meta", {})
+            cur_algo_id = str(_meta.get("live_stop_order_id") or "")
+        except Exception:
+            cur_algo_id = ""
 
     try:
         live_pos = binance_real.get_position(symbol)
@@ -837,9 +870,11 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
 
     if abs(live_size) < 1e-10 and open_qty > 0:
         realized += (price - entry) * open_qty
-        # P9.5: 外部平仓 — 撤所有 algo
+        # P12-A: external close - targeted cancel
         try:
-            binance_real.cancel_all_orders(symbol)
+            _r = binance_real.cancel_specific_algo(symbol, cur_algo_id)
+            if not _r.get("ok"):
+                print(f"[reconcile] P12 ext close cancel: {_r}", flush=True)
         except Exception as _e:
             print(f"[reconcile] external close cancel failed {symbol}: {_e}", flush=True)
         storage.trade_position_update(conn, pos["id"], {
@@ -881,9 +916,11 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
                 "advice": f"实盘 hard stop 平仓 @ ${price:.6g}",
                 "closed_at": "__CURRENT_TIMESTAMP__",
             })
-            # P9.5: hard stop — 撤所有 algo
+            # P12-A: hard stop - targeted cancel
             try:
-                binance_real.cancel_all_orders(symbol)
+                _r = binance_real.cancel_specific_algo(symbol, cur_algo_id)
+                if not _r.get("ok"):
+                    print(f"[reconcile] P12 hard stop cancel: {_r}", flush=True)
             except Exception as _e:
                 print(f"[reconcile] hard stop cancel failed {symbol}: {_e}", flush=True)
             storage.trade_position_update(conn, pos["id"], fields)
@@ -909,15 +946,17 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
                 "advice": f"实盘 TP1 已平 {config.TRADING_TP1_CLOSE_PCT:.0f}% @ ${price:.6g}",
             })
             tp1_done = True
-            # P9.5: TP1 后 sl 拉到保本
+            # P12-A: TP1 sl to breakeven (targeted replace)
             try:
-                _r = binance_real.replace_algo_stop(symbol, "SELL", new_stop_price=entry, qty=open_qty)
+                _r = binance_real.replace_algo_stop_v2(symbol, "SELL", entry, open_qty, cur_algo_id)
                 if "error" not in _r:
                     fields["binance_synced_stop_price"] = entry
+                    cur_algo_id = _r.get("new_algo_id") or ""
+                    fields["binance_stop_algo_id"] = cur_algo_id
                 else:
-                    fields["advice"] += f" | algo 同步失败: {_r['error']}"
+                    fields["advice"] += f" | algo sync fail: {_r['error']}"
             except Exception as _e:
-                fields["advice"] += f" | algo 异常: {_e}"
+                fields["advice"] += f" | algo exc: {_e}"
         except Exception as e:
             fields["advice"] = f"TP1 下单失败: {e}"
 
@@ -937,15 +976,17 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
                 "advice": f"实盘 TP2 已再平 {config.TRADING_TP2_CLOSE_PCT:.0f}% @ ${price:.6g}",
             })
             tp2_done = True
-            # P9.5: TP2 后 sl 改 trailing
+            # P12-A: TP2 sl to trailing (targeted replace)
             try:
-                _r = binance_real.replace_algo_stop(symbol, "SELL", new_stop_price=trailing, qty=open_qty)
+                _r = binance_real.replace_algo_stop_v2(symbol, "SELL", trailing, open_qty, cur_algo_id)
                 if "error" not in _r:
                     fields["binance_synced_stop_price"] = trailing
+                    cur_algo_id = _r.get("new_algo_id") or ""
+                    fields["binance_stop_algo_id"] = cur_algo_id
                 else:
-                    fields["advice"] += f" | algo 同步失败: {_r['error']}"
+                    fields["advice"] += f" | algo sync fail: {_r['error']}"
             except Exception as _e:
-                fields["advice"] += f" | algo 异常: {_e}"
+                fields["advice"] += f" | algo exc: {_e}"
         except Exception as e:
             fields["advice"] = f"TP2 下单失败: {e}"
 
@@ -955,13 +996,15 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
             highest * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100),
         )
         fields["trailing_stop_price"] = trailing
-        # P9.5: trailing 上调时同步 binance algo (0.1% 防抖)
+        # P12-A: trailing sync (0.1% deband, targeted replace)
         _last_synced = float(pos.get("binance_synced_stop_price") or 0)
         if abs(trailing - _last_synced) > entry * 0.001:
             try:
-                _r = binance_real.replace_algo_stop(symbol, "SELL", new_stop_price=trailing, qty=open_qty)
+                _r = binance_real.replace_algo_stop_v2(symbol, "SELL", trailing, open_qty, cur_algo_id)
                 if "error" not in _r:
                     fields["binance_synced_stop_price"] = trailing
+                    cur_algo_id = _r.get("new_algo_id") or ""
+                    fields["binance_stop_algo_id"] = cur_algo_id
             except Exception:
                 pass
         if price <= trailing:
@@ -977,9 +1020,11 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
                     "advice": f"实盘跟踪止盈 @ ${price:.6g}",
                     "closed_at": "__CURRENT_TIMESTAMP__",
                 })
-                # P9.5: trailing close — 撤所有 algo
+                # P12-A: trailing close - targeted cancel
                 try:
-                    binance_real.cancel_all_orders(symbol)
+                    _r = binance_real.cancel_specific_algo(symbol, cur_algo_id)
+                    if not _r.get("ok"):
+                        print(f"[reconcile] P12 trail close cancel: {_r}", flush=True)
                 except Exception as _e:
                     print(f"[reconcile] trailing close cancel failed {symbol}: {_e}", flush=True)
             except Exception as e:
@@ -1128,3 +1173,133 @@ def update_paper_positions(conn):
             "pnl_pct": _margin_pnl_pct(realized, unrealized, float(pos.get("margin_amount") or 1)),
         })
         storage.trade_position_update(conn, pos["id"], fields)
+
+
+# ============== P12-C: post-loop self-healing ==============
+def _p12c_post_reconcile(conn):
+    """P12-C: scan db OPEN/PARTIAL live positions, reconcile each stop, then kill zombies."""
+    try:
+        import config as _cfg
+        import binance_real as _br
+        import storage as _st
+    except Exception as _e:
+        print(f"[P12C] import err: {_e}", flush=True); return
+    if not getattr(_cfg, 'P12C_RECONCILE_ENABLED', False):
+        return
+    dry = bool(getattr(_cfg, 'P12C_DRY_RUN', True))
+    try:
+        rows = conn.execute("""
+            SELECT id, symbol, stop_loss_price, quantity, closed_qty
+            FROM trade_positions
+            WHERE status IN ('OPEN','PARTIAL') AND mode='live'
+        """).fetchall()
+    except Exception as e:
+        print(f"[P12C] db query err: {e}", flush=True); return
+    active_syms = set()
+    for r in rows:
+        d = dict(r) if hasattr(r, 'keys') else dict(r)
+        symbol = d.get("symbol") or ""
+        if not symbol: continue
+        active_syms.add(symbol.upper())
+        sl       = float(d.get("stop_loss_price") or 0)
+        qty      = float(d.get("quantity") or 0)
+        closed   = float(d.get("closed_qty") or 0)
+        open_qty = qty - closed
+        if sl <= 0 or open_qty <= 0: continue
+        if dry:
+            try:
+                stops = _br._list_stops(symbol)
+                print(f"[P12C-DRY] {symbol} want stop={sl} qty={open_qty}; current_stops={len(stops)}", flush=True)
+                for s in stops:
+                    print(
+                        f"  algo_id={s.get('algoId')} side={s.get('side')} "
+                        f"trigger={s.get('triggerPrice')} qty={s.get('origQty')} "
+                        f"reduceOnly={s.get('reduceOnly')}", flush=True)
+            except Exception as e:
+                print(f"[P12C-DRY] {symbol} list err: {e}", flush=True)
+            continue
+        try:
+            rr = _br.reconcile_position_stop(symbol, sl, open_qty, "SELL")
+            print(
+                f"[P12C] {symbol}: action={rr.get('action')} "
+                f"algo_id={rr.get('algo_id')} removed={rr.get('removed')}", flush=True)
+            if rr.get("action") in ("kept", "replaced", "placed"):
+                _st.trade_position_update(conn, d["id"], {
+                    "binance_stop_algo_id":     rr.get("algo_id",""),
+                    "binance_synced_stop_price": sl,
+                })
+            try:
+                import json as _json
+                _st.algo_audit_insert(conn,
+                    symbol=symbol, action=f"reconcile_{rr.get('action','?')}",
+                    position_id=d["id"], algo_id=rr.get("algo_id",""),
+                    stop_price=sl, qty=open_qty, reason="periodic_check",
+                    details=_json.dumps(rr, default=str, ensure_ascii=False))
+            except Exception: pass
+        except Exception as e:
+            print(f"[P12C] reconcile {symbol} err: {e}", flush=True)
+    # zombie killer
+    if not getattr(_cfg, 'P12C_ZOMBIE_KILL_ENABLED', True):
+        return
+    if dry:
+        try:
+            for o in _br._list_stops(None):
+                sym = str(o.get("symbol") or "").upper()
+                if sym not in active_syms:
+                    print(
+                        f"[P12C-DRY-zombie] {sym} algo_id={o.get('algoId')} "
+                        f"trigger={o.get('triggerPrice')} qty={o.get('origQty')}", flush=True)
+        except Exception as e:
+            print(f"[P12C-DRY-zombie] err: {e}", flush=True)
+        return
+    try:
+        killed = _br.kill_zombie_algo_orders(active_syms)
+        for k in killed:
+            try:
+                import json as _json
+                _st.algo_audit_insert(conn,
+                    symbol=k.get("symbol",""), action="zombie_killed",
+                    algo_id=k.get("algo_id",""),
+                    stop_price=k.get("stopPrice"), qty=k.get("qty"),
+                    reason=k.get("reason","no_position"),
+                    details=_json.dumps(k, default=str, ensure_ascii=False))
+            except Exception: pass
+        if killed:
+            print(f"[P12C-zombie] killed {len(killed)}: "
+                  f"{[(k['symbol'], k['algo_id']) for k in killed]}", flush=True)
+    except Exception as e:
+        print(f"[P12C-zombie] err: {e}", flush=True)
+
+
+# P12-C: auto-wrap the live update loop so reconcile runs every cycle.
+_P12C_WRAP_CANDIDATES = [
+    "update_real_positions",
+    "update_live_positions",
+    "reconcile_live_positions",
+    "update_positions",
+    "update_trade_positions",
+]
+def _p12c_make_wrapper(orig_fn):
+    def _wrapped(conn, *a, **kw):
+        rv = orig_fn(conn, *a, **kw)
+        try:
+            _p12c_post_reconcile(conn)
+        except Exception as _e:
+            print(f"[P12C] post_reconcile wrapper err: {_e}", flush=True)
+        return rv
+    _wrapped.__name__ = getattr(orig_fn, '__name__', 'wrapped')
+    _wrapped.__doc__  = getattr(orig_fn, '__doc__', None)
+    _wrapped._p12c_wrapped = True
+    return _wrapped
+_p12c_g = globals()
+_p12c_wrapped_name = None
+for _name in _P12C_WRAP_CANDIDATES:
+    _f = _p12c_g.get(_name)
+    if callable(_f) and not getattr(_f, '_p12c_wrapped', False):
+        _p12c_g[_name] = _p12c_make_wrapper(_f)
+        _p12c_wrapped_name = _name; break
+if _p12c_wrapped_name:
+    print(f"[P12C] wrapped main loop: {_p12c_wrapped_name}", flush=True)
+else:
+    print("[P12C] WARN: no main loop wrapped; will need manual hook", flush=True)
+# ============== /P12-C ==============

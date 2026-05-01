@@ -214,6 +214,26 @@ def get_conn():
 
 def _migrate(conn):
     """老库迁移：加 first_seen_at 列 + 新表"""
+    # P12-A (2026-05-01): trade_positions add binance_stop_algo_id
+    _cols_tp = [r[1] for r in conn.execute("PRAGMA table_info(trade_positions)").fetchall()]
+    if "binance_stop_algo_id" not in _cols_tp:
+        conn.execute("ALTER TABLE trade_positions ADD COLUMN binance_stop_algo_id TEXT")
+    # P12-C: algo audit log table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS algo_audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          symbol TEXT NOT NULL,
+          action TEXT NOT NULL,
+          position_id INTEGER,
+          algo_id TEXT,
+          stop_price REAL,
+          qty REAL,
+          reason TEXT,
+          details TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_algo_audit_ts ON algo_audit_log(ts DESC)")
     cols = [r[1] for r in conn.execute("PRAGMA table_info(posts)").fetchall()]
     if "first_seen_at" not in cols:
         conn.execute("ALTER TABLE posts ADD COLUMN first_seen_at TIMESTAMP")
@@ -832,3 +852,21 @@ def trade_reset_all(conn, new_initial_balance: float | None = None) -> dict:
         "loss_archive_deleted": archive_deleted,
         "settings": settings,
     }
+
+
+# P12-C: algo audit log helper (best-effort, never raises)
+def algo_audit_insert(conn, symbol="", action="", position_id=None, algo_id="",
+                      stop_price=None, qty=None, reason="", details=""):
+    try:
+        conn.execute("""
+            INSERT INTO algo_audit_log
+              (symbol, action, position_id, algo_id, stop_price, qty, reason, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (str(symbol), str(action), position_id,
+              str(algo_id) if algo_id else None,
+              float(stop_price) if stop_price is not None else None,
+              float(qty)        if qty is not None        else None,
+              str(reason), str(details)))
+        conn.commit()
+    except Exception:
+        pass
