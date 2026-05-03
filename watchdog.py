@@ -39,8 +39,66 @@ def emergency_close(symbol, qty, side_long, reason):
     except Exception as e:
         alert("CRITICAL", f"WATCHDOG 平仓失败 {symbol}: {e}")
 
+
+def sweep_dust_positions(threshold_usdt=1.0):
+    """P12-D: 扫 binance 端 < $1 USDT 但 DB 无 OPEN/PARTIAL 记录的 dust 残留，reduce_only 平掉。"""
+    try:
+        positions = binance_real.get_all_positions()
+    except Exception as e:
+        alert("ERROR", f"sweep_dust get_all_positions failed: {e}")
+        return
+    try:
+        with storage.get_conn() as c:
+            db_open = {r['symbol'] for r in c.cursor().execute(
+                "SELECT symbol FROM trade_positions WHERE status IN ('OPEN','PARTIAL') AND mode='live'"
+            )}
+    except Exception as e:
+        alert("ERROR", f"sweep_dust db read failed: {e}")
+        return
+
+    swept = 0
+    for p in positions:
+        try:
+            qty = abs(float(p.get('positionAmt') or 0))
+            if qty < 1e-12:
+                continue
+            sym = p['symbol']
+            if sym in db_open:
+                continue
+            mark = float(p.get('markPrice') or 0)
+            notional = qty * mark
+            if notional >= threshold_usdt:
+                # 安全网：≥1U 但不在 DB → 异常，告警不自动平
+                alert("WARNING", f"orphan position {sym} qty={qty} notional=${notional:.2f} not in DB - manual check")
+                continue
+            # 是 dust，reduce_only 平
+            side = 'SELL' if float(p['positionAmt']) > 0 else 'BUY'
+            try:
+                r = binance_real.place_market(sym, side, qty, reduce_only=True)
+                oid = r.get('orderId') if isinstance(r, dict) else r
+                alert("INFO", f"dust sweep {sym} {side} qty={qty} ~${notional:.4f} orderId={oid}")
+                swept += 1
+            except Exception as e:
+                alert("ERROR", f"dust sweep {sym} place_market failed: {e}")
+            try:
+                binance_real.cancel_all_orders(sym)
+            except Exception:
+                pass
+        except Exception as e:
+            alert("ERROR", f"sweep_dust loop exc on {p}: {e}")
+    if swept > 0:
+        alert("INFO", f"sweep_dust: {swept} dust positions cleaned")
+
+
 def main():
     storage.init_db()
+
+    # P12-D 2026-05-03: 独立 dust sweep（不依赖 DB 有 OPEN 仓位）
+    try:
+        sweep_dust_positions()
+    except Exception as e:
+        alert("ERROR", f"sweep_dust_positions exception: {e}")
+
     
     rc = subprocess.run(["systemctl", "is-active", "--quiet", "zaijin-auto_trader"]).returncode
     if rc != 0:

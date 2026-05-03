@@ -246,6 +246,10 @@ def build_trade_candidates(conn, limit: int = 20, passed_only: bool = False) -> 
         result["score"] = score_row
         result["signal_key"] = signal_key
         result["has_active_position"] = storage.trade_has_active(conn, score_row["token"])
+        if score_row["token"].upper() in (getattr(config, "TRADING_TOKEN_BLACKLIST", []) or []):
+            result["passed"] = False
+            result["tier"] = "skip"
+            result["reasons"] = (result.get("reasons") or []) + ["manual_blacklist"]
         if passed_only and not result.get("passed"):
             continue
         candidates.append(result)
@@ -518,6 +522,15 @@ def open_paper_position(conn, candidate: dict, settings: dict) -> bool | dict:
             _debug_reject(token, f"实盘下单失败: {live.get('error')}", candidate)
             return False
         fill_price = live["fill_price"]
+        # === BUG FIX 2026-05-02: 用 fill_price 重算 stop_loss_price ===
+        # raw_price 与 fill_price 偏差大时（stale realtime cache 等），旧逻辑导致
+        # stop 距离 entry 是 raw 时刻的距离，而不是设计的 stop_pct。
+        # BIO: raw=0.0374 stop=0.0355(-5%) fill=0.05048 -> 实际 stop_dist=-29.7% (6x 风险敞口)
+        try:
+            _spct = stop_pct  # type: ignore[name-defined]
+        except NameError:
+            _spct = config.TRADING_STOP_LOSS_PCT
+        stop_loss_price = fill_price * (1 + _spct / 100)
         new_risk = fill_price - stop_loss_price
         if new_risk <= 0:
             try:
@@ -530,6 +543,7 @@ def open_paper_position(conn, candidate: dict, settings: dict) -> bool | dict:
         position["limit_price"] = fill_price
         position["current_price"] = fill_price
         position["highest_price"] = fill_price
+        position["stop_loss_price"] = stop_loss_price  # === BUG FIX: 同步重算的 stop ===
         position["tp1_price"] = fill_price + new_risk * config.TRADING_TP1_R
         position["tp2_price"] = fill_price + new_risk * config.TRADING_TP2_R
         snapshot["_risk_meta"]["live_order_id"] = live["order_id"]
@@ -671,6 +685,15 @@ def manual_open_on_watch(conn, token: str, settings: dict) -> dict:
         if not live["ok"]:
             return {"ok": False, "reason": f"实盘下单失败: {live.get('error')}"}
         fill_price = live["fill_price"]
+        # === BUG FIX 2026-05-02: 用 fill_price 重算 stop_loss_price ===
+        # raw_price 与 fill_price 偏差大时（stale realtime cache 等），旧逻辑导致
+        # stop 距离 entry 是 raw 时刻的距离，而不是设计的 stop_pct。
+        # BIO: raw=0.0374 stop=0.0355(-5%) fill=0.05048 -> 实际 stop_dist=-29.7% (6x 风险敞口)
+        try:
+            _spct = stop_pct  # type: ignore[name-defined]
+        except NameError:
+            _spct = config.TRADING_STOP_LOSS_PCT
+        stop_loss_price = fill_price * (1 + _spct / 100)
         new_risk = fill_price - stop_loss_price
         if new_risk <= 0:
             try:
@@ -682,6 +705,7 @@ def manual_open_on_watch(conn, token: str, settings: dict) -> dict:
         position["limit_price"] = fill_price
         position["current_price"] = fill_price
         position["highest_price"] = fill_price
+        position["stop_loss_price"] = stop_loss_price  # === BUG FIX: 同步重算的 stop ===
         position["tp1_price"] = fill_price + new_risk * config.TRADING_TP1_R
         position["tp2_price"] = fill_price + new_risk * config.TRADING_TP2_R
         snapshot["_risk_meta"]["live_order_id"] = live["order_id"]
@@ -905,8 +929,12 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
     stop = float(pos.get("stop_loss_price") or 0)
     if not tp1_done and stop > 0 and price <= stop:
         try:
-            binance_real.place_market(symbol, "SELL", open_qty, reduce_only=True)
-            realized += (price - entry) * open_qty
+            # === DUST FIX 2026-05-03: binance 实时 positionAmt 兜底 ===
+            _fresh_pos = binance_real.get_position(symbol)
+            _fresh_qty = abs(float(_fresh_pos.get("positionAmt") or 0))
+            _close_qty = max(open_qty, _fresh_qty)
+            binance_real.place_market(symbol, "SELL", _close_qty, reduce_only=True)
+            realized += (price - entry) * _close_qty
             fields.update({
                 "status": "CLOSED",
                 "closed_qty": qty,
@@ -1009,8 +1037,12 @@ def _reconcile_live_position(conn, pos, market, realtime, price):
                 pass
         if price <= trailing:
             try:
-                binance_real.place_market(symbol, "SELL", open_qty, reduce_only=True)
-                realized += (price - entry) * open_qty
+                # === DUST FIX 2026-05-03: binance 实时 positionAmt 兜底 ===
+                _fresh_pos = binance_real.get_position(symbol)
+                _fresh_qty = abs(float(_fresh_pos.get("positionAmt") or 0))
+                _close_qty = max(open_qty, _fresh_qty)
+                binance_real.place_market(symbol, "SELL", _close_qty, reduce_only=True)
+                realized += (price - entry) * _close_qty
                 fields.update({
                     "status": "CLOSED",
                     "closed_qty": qty,
