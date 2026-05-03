@@ -58,6 +58,7 @@ class AccountContext:
     open_positions_by_sector: dict = field(default_factory=dict)  # {sector: count}
     trades_opened_today: int = 0                   # 今日已开仓次数
     last_stop_loss_by_token: dict = field(default_factory=dict)   # {token: datetime} 最近一次止损时间
+    last_close_by_token: dict = field(default_factory=dict)       # P13: {token: datetime} 最近任何平仓
 
 
 # ---------- 决策结果 ----------
@@ -486,6 +487,27 @@ def check_account_risk(
                         allowed=False,
                         reason=f"{token} 止损冷却中，还剩 {remain:.1f} 分钟",
                         details={"cooldown_remaining_min": remain},
+                    )
+
+    # 4.5 P13: 任何平仓后冷却 (治 SKYAI 类型 reentry)
+    if not bypass_cooldown:
+        last_close = account.last_close_by_token.get(token.upper())
+        if last_close:
+            if isinstance(last_close, str):
+                try:
+                    last_close = datetime.fromisoformat(last_close.replace("Z", "+00:00"))
+                except Exception:
+                    last_close = None
+            if last_close:
+                if last_close.tzinfo is None:
+                    last_close = last_close.replace(tzinfo=timezone.utc)
+                cooldown_min = getattr(config, "TRADING_COOLDOWN_MINUTES_AFTER_CLOSE", 15)
+                if now - last_close < timedelta(minutes=cooldown_min):
+                    remain = cooldown_min - (now - last_close).total_seconds() / 60
+                    return RiskDecision(
+                        allowed=False,
+                        reason=f"{token} 平仓冷却中（任何类型），还剩 {remain:.1f} 分钟",
+                        details={"close_cooldown_remaining_min": remain},
                     )
 
     # 5. 板块集中度

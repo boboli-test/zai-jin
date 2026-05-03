@@ -734,6 +734,18 @@ def trade_last_stop_loss_map(conn, hours: int = 24) -> dict:
     return result
 
 
+def trade_last_close_map(conn, hours: int = 4) -> dict:
+    # P13: 返回 {token: last_closed_at} 最近 hours 小时内任何平仓 (持久化, restart 不丢)
+    cur = conn.execute(
+        "SELECT token, MAX(closed_at) AS closed_at FROM trade_positions "
+        "WHERE closed_at IS NOT NULL AND closed_at > datetime('now', ?) "
+        "AND status = 'CLOSED' AND mode = 'live' GROUP BY token",
+        (f"-{hours} hours",)
+    )
+    return {row["token"].upper(): row["closed_at"]
+            for row in cur.fetchall() if row["closed_at"]}
+
+
 def trade_open_positions_by_sector(conn) -> dict:
     """返回 {sector: count}。需要在调用方用 risk.sector_of 做映射。"""
     # 这个函数只返回 token list，分类交给 risk 模块

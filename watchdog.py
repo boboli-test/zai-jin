@@ -107,6 +107,7 @@ def main():
     with storage.get_conn() as conn:
         rows = conn.execute("""
             SELECT id, token, symbol, side, quantity, entry_price, stop_loss_price,
+                   COALESCE(closed_qty, 0) as closed_qty,
                    COALESCE(updated_at, created_at) as last_update
             FROM trade_positions
             WHERE mode='live' AND status IN ('OPEN','PARTIAL')
@@ -140,6 +141,17 @@ def main():
             continue
         mark = float(bp.get('markPrice') or 0)
         
+        # === INVARIANT WATCHDOG P13 2026-05-03 ===
+        # 主程序 invariant 漏网时兜底. 仅校验首次开仓 (closed_qty=0). TP1+ 跳过.
+        _closed_qty = float(d.get('closed_qty') or 0)
+        _entry_p = float(d.get('entry_price') or 0)
+        if sl > 0 and _entry_p > 0 and _closed_qty < 1e-10 and side_long:
+            _inv_pct = (sl / _entry_p - 1) * 100
+            if not (-5.5 <= _inv_pct <= -0.7):
+                alert('CRITICAL', f"{sym} INVARIANT FAIL stop_dist={_inv_pct:.2f}% entry={_entry_p} sl={sl}")
+                emergency_close(sym, actual_qty, side_long, f"invariant_fail dist={_inv_pct:.2f}%")
+                continue
+
         # 兜底硬止损 (独立判断, 不信 watcher)
         breach = (sl > 0 and side_long and mark <= sl) or (sl > 0 and not side_long and mark >= sl)
         if breach:
@@ -159,6 +171,16 @@ def main():
         except Exception as e:
             alert("WARNING", f"{sym} parse last_update fail: {e}")
     
+    # === SNAPSHOT FRESHNESS P13 2026-05-03 ===
+    try:
+        with storage.get_conn() as _c:
+            _stale = _c.execute("SELECT token, updated_at FROM market_snapshots WHERE updated_at < datetime('now', '-300 seconds') ORDER BY updated_at ASC LIMIT 5").fetchall()
+            if _stale:
+                _detail = ', '.join('{}({})'.format(r[0], r[1]) for r in _stale)
+                alert('WARNING', 'market_snapshots 陈旧 {} 个: {}'.format(len(_stale), _detail))
+    except Exception as _e:
+        alert('WARNING', 'snapshot freshness check fail: ' + str(_e))
+
     alert("INFO", f"watchdog OK, {len(rows)} pos: " + ", ".join(summary))
 
 if __name__ == "__main__":

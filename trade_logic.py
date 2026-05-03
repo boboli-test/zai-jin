@@ -310,6 +310,8 @@ def _build_account_context(conn) -> risk.AccountContext:
         trades_opened_today=storage.trade_count_today_opened(conn),
         last_stop_loss_by_token=storage.trade_last_stop_loss_map(
             conn, hours=max(2, config.TRADING_COOLDOWN_MINUTES_AFTER_LOSS // 30 + 1)),
+        last_close_by_token=storage.trade_last_close_map(
+            conn, hours=max(2, getattr(config, "TRADING_COOLDOWN_MINUTES_AFTER_CLOSE", 15) // 30 + 1)),
     )
 
 
@@ -539,6 +541,25 @@ def open_paper_position(conn, candidate: dict, settings: dict) -> bool | dict:
                 pass
             _debug_reject(token, f"成交价 {fill_price} 已破止损 {stop_loss_price}, 紧急平仓", candidate)
             return False
+        # === INVARIANT P13 2026-05-03: stop_distance_pct 必须在风控边界内 ===
+        # 即使再有绕过 BIO fix 的 stale price 路径, 超界仓位也不能落库 (BIO 当时 -29.7%)
+        _actual_stop_pct = (stop_loss_price / fill_price - 1) * 100
+        _INV_MAX = config.TRADING_STOP_LOSS_MAX_PCT - 0.5
+        _INV_MIN = config.TRADING_STOP_LOSS_MIN_PCT + 0.5
+        if not (_INV_MAX <= _actual_stop_pct <= _INV_MIN):
+            _msg = (
+                f"INVARIANT FAIL {token}: stop_dist={_actual_stop_pct:.2f}% "
+                f"out of [{_INV_MAX:.1f},{_INV_MIN:.1f}] "
+                f"(fill={fill_price} sl={stop_loss_price} design={_spct:.2f}%)"
+            )
+            print(f"[CRITICAL] {_msg}", flush=True)
+            try:
+                binance_real.cancel_all_orders(position["symbol"])
+                binance_real.place_market(position["symbol"], "SELL", quantity, reduce_only=True)
+            except Exception:
+                pass
+            _debug_reject(token, _msg, candidate)
+            return False
         position["entry_price"] = fill_price
         position["limit_price"] = fill_price
         position["current_price"] = fill_price
@@ -701,6 +722,23 @@ def manual_open_on_watch(conn, token: str, settings: dict) -> dict:
             except Exception:
                 pass
             return {"ok": False, "reason": f"成交价 {fill_price} 已破止损 {stop_loss_price}, 紧急平仓"}
+        # === INVARIANT P13 2026-05-03: stop_distance_pct 必须在风控边界内 ===
+        _actual_stop_pct = (stop_loss_price / fill_price - 1) * 100
+        _INV_MAX = config.TRADING_STOP_LOSS_MAX_PCT - 0.5
+        _INV_MIN = config.TRADING_STOP_LOSS_MIN_PCT + 0.5
+        if not (_INV_MAX <= _actual_stop_pct <= _INV_MIN):
+            _msg = (
+                f"INVARIANT FAIL {token}: stop_dist={_actual_stop_pct:.2f}% "
+                f"out of [{_INV_MAX:.1f},{_INV_MIN:.1f}] "
+                f"(fill={fill_price} sl={stop_loss_price} design={_spct:.2f}%)"
+            )
+            print(f"[CRITICAL] {_msg}", flush=True)
+            try:
+                binance_real.cancel_all_orders(position["symbol"])
+                binance_real.place_market(position["symbol"], "SELL", quantity, reduce_only=True)
+            except Exception:
+                pass
+            return {"ok": False, "reason": _msg}
         position["entry_price"] = fill_price
         position["limit_price"] = fill_price
         position["current_price"] = fill_price
