@@ -449,7 +449,7 @@ def check_account_risk(
             )
 
     # 2. 日交易次数上限（永不豁免）
-    if account.trades_opened_today >= config.TRADING_MAX_DAILY_TRADES:
+    if config.TRADING_MAX_DAILY_TRADES > 0 and account.trades_opened_today >= config.TRADING_MAX_DAILY_TRADES:
         return RiskDecision(
             allowed=False,
             reason=f"日交易次数已达上限 {config.TRADING_MAX_DAILY_TRADES}",
@@ -514,7 +514,7 @@ def check_account_risk(
     if not bypass_sector_limit:
         sector = sector_of(token)
         sector_count = account.open_positions_by_sector.get(sector, 0)
-        if sector != "other" and sector_count >= config.TRADING_CORRELATED_LIMIT:
+        if sector != "other" and config.TRADING_CORRELATED_LIMIT > 0 and sector_count >= config.TRADING_CORRELATED_LIMIT:
             return RiskDecision(
                 allowed=False,
                 reason=f"板块 '{sector}' 已有 {sector_count} 个同向仓位（上限 {config.TRADING_CORRELATED_LIMIT}）",

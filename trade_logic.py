@@ -151,11 +151,6 @@ def evaluate_candidate(score_row: dict, rank: int, market: dict, realtime: dict)
 
     quality = risk.evaluate_entry_quality(snap, realtime, signal_score, verdict)
 
-    # P10 (2026-05-01): rank > 6 历史亏损区硬否决
-    # paper 10 单回测: rank<=6 -> 2/2 wins +$1.469, rank>6 -> 2/8 wins -$1.976
-    if rank and rank > 6:
-        quality["hard_block"].append(f"rank={rank} > 6 (P10 历史亏损区)")
-        quality["tier"] = "skip"
 
     tier = quality["tier"]
     passed = tier != "skip"
@@ -447,13 +442,6 @@ def open_paper_position(conn, candidate: dict, settings: dict) -> bool | dict:
     klines = get_klines_1h(token, limit=max(30, config.TRADING_ATR_PERIOD + 2))
     stop_pct, stop_mode = risk.compute_stop_distance_pct(klines)
     stop_loss_price = entry_price * (1 + stop_pct / 100)
-
-    # 抢 signal lock
-    signal_key = candidate.get("signal_key") or storage.leaderboard_signal_key(conn)
-    if not storage.trade_signal_lock_acquire(conn, token, signal_key):
-        _debug_reject(token, f"signal_lock 已占用 (signal_key={signal_key})", candidate)
-        return False
-
     # 计算仓位
     leverage = float(settings.get("leverage") or config.TRADING_LEVERAGE)
     sizing = risk.compute_position_size(account, entry_price, stop_loss_price, leverage, tier)

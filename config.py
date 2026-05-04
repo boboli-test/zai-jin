@@ -92,13 +92,13 @@ TRADING_MIN_NOTIONAL = 10.0              # 名义价值下限，低于此值不�
 TRADING_MAX_NOTIONAL_PCT = 50.0          # 单笔名义价值不超过账户净值的百分比
 
 # --- 风控硬限制 ---
-TRADING_MAX_CONCURRENT_POSITIONS = 6     # v2.5：0 = 不限制（用户要求）。
+TRADING_MAX_CONCURRENT_POSITIONS = 5
                                           # 可用余额自然限制实际能开的仓位数。
 TRADING_MAX_DAILY_LOSS_PCT = 5.0         # 当日浮动+已实现亏损超该百分比则熔断停机
-TRADING_MAX_DAILY_TRADES = 20             # 当日最多开仓次数
+TRADING_MAX_DAILY_TRADES = 100
 TRADING_COOLDOWN_MINUTES_AFTER_LOSS = 30 # 同一 token 止损后冷却期（分钟）
 TRADING_COOLDOWN_MINUTES_AFTER_CLOSE = 15 # P13: 任何平仓后冷却（治 SKYAI reentry）
-TRADING_CORRELATED_LIMIT = 2             # 相关度高的板块同向仓位上限（目前按粗分类）
+TRADING_CORRELATED_LIMIT = 20             # 相关度高的板块同向仓位上限（目前按粗分类）
 
 # --- 止损：波动率自适应（ATR 风格）---
 # 止损距离 = max(MIN_STOP_PCT, ATR_MULTIPLIER * 最近 N 根 K 线的 ATR%)
