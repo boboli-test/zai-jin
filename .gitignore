@@ -12,3 +12,8 @@ logs/
 .env.*
 trading_data.db
 binance_square.db
+# housekeeping (5-04)
+install*.log
+*.bak.*
+*.DISABLED.*
+rollback_*.sh
